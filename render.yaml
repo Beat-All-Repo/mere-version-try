@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: beat-caption-thumbnail-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: AUTHORIZED_USERS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PORT
+        value: 10000
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      # Optional – copies a custom welcome message
+      - key: WELCOME_MESSAGE_ID
+        sync: false
+      - key: WELCOME_MESSAGE_CHAT_ID
+        sync: false

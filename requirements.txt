@@ -1,0 +1,5 @@
+python-telegram-bot==21.0
+aiohttp==3.10.5
+psycopg==3.2.3
+psycopg-binary==3.2.3
+psycopg-pool==3.2.7
