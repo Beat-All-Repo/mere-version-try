@@ -1,9 +1,10 @@
 import os
+import io
 import asyncio
 from aiohttp import web
 import psycopg
 from psycopg_pool import AsyncConnectionPool
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 
@@ -224,6 +225,30 @@ async def advance_counters():
         progress["total_episode"] += 1
         progress["video_count"]   = 0
     await save_progress()
+
+
+async def get_cover_input(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Download the stored thumbnail photo and return it as a fresh InputFile.
+
+    WHY:  Telegram Bot API explicitly states "Thumbnails can't be reused and
+          can be only uploaded as a new file."  Passing a file_id to
+          thumbnail= or cover= is silently ignored — the cover never appears.
+          We MUST download the raw bytes and re-upload them fresh every time.
+    """
+    file_id = progress.get("thumbnail_file_id")
+    if not file_id:
+        return None
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        buf.seek(0)
+        return InputFile(buf, filename="cover.jpg")
+    except Exception as e:
+        print(f"\u26a0\ufe0f Could not prepare cover image: {e}", flush=True)
+        return None
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -758,8 +783,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.video.file_id
         quality = current_quality()
         caption = build_caption(quality)
-        thumb   = progress.get("thumbnail_file_id")
-
         print(f"📤 Sending video to {progress['target_chat_id']} | quality={quality} | thumb={'yes' if thumb else 'no'}", flush=True)
 
         try:
@@ -772,20 +795,26 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
+            # Download cover bytes fresh — Telegram rejects reused file_ids for covers
+            cover_input = await get_cover_input(context)
+
             send_kwargs = dict(
                 chat_id=progress["target_chat_id"],
                 video=file_id,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
             )
-            if thumb:
-                send_kwargs["thumbnail"] = thumb
+            if cover_input:
+                # thumbnail= sets the file-list icon; cover= sets the video preview image
+                # Pass both so it works on all client versions
+                send_kwargs["thumbnail"] = cover_input
+                send_kwargs["api_kwargs"] = {"cover": cover_input}
 
             sent_msg = await context.bot.send_video(**send_kwargs)
             print(f"✅ Video sent. Message ID: {sent_msg.message_id}", flush=True)
 
             await update.message.reply_text(
-                f"✅ <b>Video posted with caption + {'thumbnail' if thumb else 'no thumbnail'}!</b>\n\n"
+                f"✅ <b>Video posted with caption + {'cover' if cover_input else 'no thumbnail'}!</b>\n\n"
                 f"{caption}\n\n"
                 f"Progress: {progress['video_count'] + 1}/{len(progress['selected_qualities'])} for this episode",
                 parse_mode=ParseMode.HTML,
@@ -833,40 +862,42 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         quality = current_quality()
         caption = build_caption(quality)
-        thumb   = progress.get("thumbnail_file_id")
         msg_id  = channel_post.message_id
 
-        print(f"🤖 Channel auto-post detected: msg_id={msg_id} | quality={quality} | thumb={'yes' if thumb else 'no'}", flush=True)
+        # Download cover bytes fresh — Telegram rejects reused file_ids for covers
+        cover_input = await get_cover_input(context)
+
+        print(f"🤖 Channel auto-post: msg_id={msg_id} | quality={quality} | cover={'yes' if cover_input else 'no'}", flush=True)
 
         try:
-            if thumb:
-                # ── Re-post with thumbnail ────────────────────────────
-                # Step 1: delete the original (uncaptioned/uncovered) video
+            if cover_input:
+                # ── Re-post with cover ────────────────────────────────
+                # Must delete + resend: Telegram has no API to change video cover in-place
                 try:
                     await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
                     print(f"🗑️ Deleted original post {msg_id}", flush=True)
                 except Exception as del_err:
                     print(f"⚠️ Could not delete original post: {del_err}", flush=True)
 
-                # Step 2: re-send with caption + thumbnail
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=channel_post.video.file_id,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
-                    thumbnail=thumb,
+                    thumbnail=cover_input,
+                    api_kwargs={"cover": cover_input},
                 )
-                print("✅ Re-posted with thumbnail + caption", flush=True)
+                print("✅ Re-posted with cover + caption", flush=True)
 
             else:
-                # ── Just edit the caption (no thumbnail to set) ───────
+                # ── Just edit the caption (no cover to set) ───────────
                 await context.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=msg_id,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                 )
-                print("✅ Caption edited (no thumbnail)", flush=True)
+                print("✅ Caption edited (no cover)", flush=True)
 
             await advance_counters()
 
