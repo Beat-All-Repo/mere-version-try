@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import asyncio
 from aiohttp import web
 import psycopg
@@ -32,6 +33,57 @@ print(f"Auth: {AUTHORIZED_USERS or 'Open to all'}", flush=True)
 ALL_QUALITIES = ["480p", "720p", "1080p", "4K", "2160p"]
 
 # ══════════════════════════════════════════════════════════════
+#  EPISODE RECOGNITION
+#  Parses patterns like:
+#    S01E25  /  S1E5  /  s02e10
+#    Season 2 Episode 5
+#    480p  720p  1080p  4K  2160p
+#  from any caption or filename string.
+# ══════════════════════════════════════════════════════════════
+_SE_PATTERNS = [
+    # S01E25 style (most common)
+    re.compile(r'\bS(\d{1,2})E(\d{1,3})\b', re.IGNORECASE),
+    # Season 1 Episode 25 style
+    re.compile(r'\bSeason\s*(\d{1,2})\s*Episode\s*(\d{1,3})\b', re.IGNORECASE),
+    # 1x25 style
+    re.compile(r'\b(\d{1,2})x(\d{1,3})\b', re.IGNORECASE),
+]
+# Quality tokens in descending specificity
+_QUALITY_MAP = [
+    (re.compile(r'\b2160p\b', re.IGNORECASE), "2160p"),
+    (re.compile(r'\b4K\b',    re.IGNORECASE), "4K"),
+    (re.compile(r'\b1080p\b', re.IGNORECASE), "1080p"),
+    (re.compile(r'\b720p\b',  re.IGNORECASE), "720p"),
+    (re.compile(r'\b480p\b',  re.IGNORECASE), "480p"),
+]
+
+
+def parse_episode_info(text: str):
+    """
+    Returns (season, episode, quality) from a caption/filename string,
+    or (None, None, None) if nothing could be parsed.
+    """
+    if not text:
+        return None, None, None
+
+    season, episode, quality = None, None, None
+
+    for pat in _SE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            season  = int(m.group(1))
+            episode = int(m.group(2))
+            break
+
+    for q_pat, q_label in _QUALITY_MAP:
+        if q_pat.search(text):
+            quality = q_label
+            break
+
+    return season, episode, quality
+
+
+# ══════════════════════════════════════════════════════════════
 #  IN-MEMORY STATE
 # ══════════════════════════════════════════════════════════════
 progress = {
@@ -60,17 +112,39 @@ progress = {
     "thumbnail_file_id":    None,
 }
 
-waiting_for_input = {}
-last_bot_messages = {}
-upload_lock       = asyncio.Lock()
-db_pool           = None
+waiting_for_input  = {}
+last_bot_messages  = {}
+db_pool            = None
+
+# ══════════════════════════════════════════════════════════════
+#  SERIAL QUEUE  (replaces upload_lock)
+#  A single asyncio.Queue + one worker task guarantee that
+#  channel-post events are processed strictly one at a time,
+#  even when Telegram delivers several updates simultaneously.
+# ══════════════════════════════════════════════════════════════
+_channel_post_queue: asyncio.Queue = asyncio.Queue()
+_queue_worker_task:  asyncio.Task  = None          # started in post_init
+
+
+async def _channel_post_worker():
+    """Drain the queue sequentially, never running two jobs at once."""
+    while True:
+        job = await _channel_post_queue.get()
+        try:
+            await _process_channel_post(*job)
+        except Exception as e:
+            print(f"Worker error: {e}", flush=True)
+            import traceback; traceback.print_exc()
+        finally:
+            _channel_post_queue.task_done()
+
 
 # ══════════════════════════════════════════════════════════════
 #  SMALL CAPS
 # ══════════════════════════════════════════════════════════════
 _SC_MAP = str.maketrans(
     "abcdefghijklmnopqrstuvwxyz",
-    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᶻ" # Replaced the 17th character with 'ǫ'
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᶻ"
 )
 def sc(t: str) -> str:
     return t.lower().translate(_SC_MAP)
@@ -184,12 +258,15 @@ async def delete_last_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         del last_bot_messages[chat_id]
 
 
-def build_caption(quality: str) -> str:
+def build_caption(quality: str, season: int = None, episode: int = None) -> str:
+    s   = season  if season  is not None else progress["season"]
+    ep  = episode if episode is not None else progress["episode"]
+    tot = progress["total_episode"]
     return (
         progress["base_caption"]
-        .replace("{season}",        f"{progress['season']:02}")
-        .replace("{episode}",       f"{progress['episode']:02}")
-        .replace("{total_episode}", f"{progress['total_episode']:02}")
+        .replace("{season}",        f"{s:02}")
+        .replace("{episode}",       f"{ep:02}")
+        .replace("{total_episode}", f"{tot:02}")
         .replace("{quality}",       quality)
     )
 
@@ -235,9 +312,9 @@ def settings_panel() -> str:
     thumb = bool(progress.get("thumbnail_file_id"))
     s, ep, tot = progress["season"], progress["episode"], progress["total_episode"]
     quals = ", ".join(progress["selected_qualities"]) if progress["selected_qualities"] else sc("none")
-    ch_txt    = f"<code>{ch}</code>"      if ch    else f"<i>{sc('not set')}</i>"
-    ac_txt    = f"<b>{sc('on')}</b>"      if ac    else f"<i>{sc('off')}</i>"
-    thumb_txt = f"<b>{sc('set')}</b>"     if thumb else f"<i>{sc('not set')}</i>"
+    ch_txt    = f"<code>{ch}</code>"  if ch    else f"<i>{sc('not set')}</i>"
+    ac_txt    = f"<b>{sc('on')}</b>"  if ac    else f"<i>{sc('off')}</i>"
+    thumb_txt = f"<b>{sc('set')}</b>" if thumb else f"<i>{sc('not set')}</i>"
     return (
         f"\u250c {sc('channel')}        {ch_txt}\n"
         f"\u251c {sc('auto-caption')}  {ac_txt}\n"
@@ -260,8 +337,8 @@ def home_text(prefix: str = "") -> str:
 def get_menu_markup() -> InlineKeyboardMarkup:
     ac    = progress.get("auto_caption_enabled", True)
     thumb = bool(progress.get("thumbnail_file_id"))
-    ac_btn    = f"{'\u2705' if ac else '\u2610'}  {sc('Auto-Caption')}  {'\u1d0f\u0274' if ac else '\u1d0f\uA730\uA730'}"
-    thumb_btn = f"{'\U0001f5bc\ufe0f' if thumb else '\U0001f304'}  {sc('Cover Image')}  {'\u2714' if thumb else ''}"
+    ac_btn    = f"{chr(0x2705) if ac else chr(0x2610)}  {sc('Auto-Caption')}  {sc('on') if ac else sc('off')}"
+    thumb_btn = f"{chr(0x1F5BC)+chr(0xFE0F) if thumb else chr(0x1F304)}  {sc('Cover Image')}  {chr(0x2714) if thumb else ''}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"\U0001f441  {sc('Preview Caption')}",    callback_data="preview")],
         [InlineKeyboardButton(f"\u270f\ufe0f  {sc('Edit Caption')}",       callback_data="set_caption")],
@@ -763,75 +840,74 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"\u26d4  {sc('You are not authorized.')}")
         return
 
-    async with upload_lock:
-        if not progress["target_chat_id"]:
-            await update.message.reply_text(
-                f"\u274c  <b>{sc('No Target Channel')}</b>\n\n<i>{sc('Set a target channel from the main menu.')}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        if not progress["selected_qualities"]:
-            await update.message.reply_text(
-                f"\u274c  <b>{sc('No Qualities Selected')}</b>\n\n<i>{sc('Select at least one quality from Quality Settings.')}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+    if not progress["target_chat_id"]:
+        await update.message.reply_text(
+            f"\u274c  <b>{sc('No Target Channel')}</b>\n\n<i>{sc('Set a target channel from the main menu.')}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not progress["selected_qualities"]:
+        await update.message.reply_text(
+            f"\u274c  <b>{sc('No Qualities Selected')}</b>\n\n<i>{sc('Select at least one quality from Quality Settings.')}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-        file_id = update.message.video.file_id
-        quality = current_quality()
-        caption = build_caption(quality)
-        print(f"Posting to {progress['target_chat_id']} Q={quality}", flush=True)
+    file_id = update.message.video.file_id
+    quality = current_quality()
+    caption = build_caption(quality)
+    print(f"Posting to {progress['target_chat_id']} Q={quality}", flush=True)
 
-        try:
-            await context.bot.get_chat(progress["target_chat_id"])
-        except Exception as e:
-            await update.message.reply_text(
-                f"\u274c  <b>{sc('Cannot Reach Channel')}</b>\n\n<code>{e}</code>\n\n"
-                f"<i>{sc('Ensure the bot is admin with Post Messages permission.')}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+    try:
+        await context.bot.get_chat(progress["target_chat_id"])
+    except Exception as e:
+        await update.message.reply_text(
+            f"\u274c  <b>{sc('Cannot Reach Channel')}</b>\n\n<code>{e}</code>\n\n"
+            f"<i>{sc('Ensure the bot is admin with Post Messages permission.')}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-        try:
-            cover_input = await get_cover_input(context)
-            send_kwargs = dict(
-                chat_id=progress["target_chat_id"],
-                video=file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-            if cover_input:
-                send_kwargs["thumbnail"]  = cover_input
-                send_kwargs["api_kwargs"] = {"cover": cover_input}
+    try:
+        cover_input = await get_cover_input(context)
+        send_kwargs = dict(
+            chat_id=progress["target_chat_id"],
+            video=file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        if cover_input:
+            send_kwargs["thumbnail"]  = cover_input
+            send_kwargs["api_kwargs"] = {"cover": cover_input}
 
-            sent_msg = await context.bot.send_video(**send_kwargs)
-            print(f"Sent msg_id={sent_msg.message_id}", flush=True)
+        sent_msg = await context.bot.send_video(**send_kwargs)
+        print(f"Sent msg_id={sent_msg.message_id}", flush=True)
 
-            idx   = progress["video_count"] + 1
-            total = len(progress["selected_qualities"])
-            await update.message.reply_text(
-                f"\u2705  <b>{sc('Posted to Channel!')}</b>\n\n"
-                f"<blockquote>"
-                f"\U0001f3ac  {sc('quality')}    <b>{quality}</b>\n"
-                f"\U0001f5bc\ufe0f  {sc('cover')}      <b>{'set' if cover_input else 'none'}</b>\n"
-                f"\U0001f4ca  {sc('progress')}  <b>{idx}/{total}</b> {sc('for this episode')}"
-                f"</blockquote>",
-                parse_mode=ParseMode.HTML,
-            )
-            await advance_counters()
+        idx   = progress["video_count"] + 1
+        total = len(progress["selected_qualities"])
+        await update.message.reply_text(
+            f"\u2705  <b>{sc('Posted to Channel!')}</b>\n\n"
+            f"<blockquote>"
+            f"\U0001f3ac  {sc('quality')}    <b>{quality}</b>\n"
+            f"\U0001f5bc\ufe0f  {sc('cover')}      <b>{'set' if cover_input else 'none'}</b>\n"
+            f"\U0001f4ca  {sc('progress')}  <b>{idx}/{total}</b> {sc('for this episode')}"
+            f"</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        await advance_counters()
 
-        except Exception as e:
-            err = str(e).lower()
-            if "not enough rights" in err or "admin" in err:
-                await update.message.reply_text(f"\u26d4  {sc('Bot lacks admin rights in the target channel.')}")
-            elif "chat not found" in err:
-                await update.message.reply_text(f"\u274c  {sc('Channel not found. Please reset the target channel.')}")
-            else:
-                await update.message.reply_text(f"\u274c  <code>{e}</code>", parse_mode=ParseMode.HTML)
-            import traceback; traceback.print_exc()
+    except Exception as e:
+        err = str(e).lower()
+        if "not enough rights" in err or "admin" in err:
+            await update.message.reply_text(f"\u26d4  {sc('Bot lacks admin rights in the target channel.')}")
+        elif "chat not found" in err:
+            await update.message.reply_text(f"\u274c  {sc('Channel not found. Please reset the target channel.')}")
+        else:
+            await update.message.reply_text(f"\u274c  <code>{e}</code>", parse_mode=ParseMode.HTML)
+        import traceback; traceback.print_exc()
 
 # ══════════════════════════════════════════════════════════════
-#  CHANNEL POST HANDLER (auto-caption + auto-cover)
+#  CHANNEL POST HANDLER  — just enqueues, never blocks polling
 # ══════════════════════════════════════════════════════════════
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_post = update.channel_post
@@ -843,19 +919,51 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not progress.get("auto_caption_enabled", False):
         return
 
-    async with upload_lock:
-        await load_progress()
-        if not progress["selected_qualities"]:
-            print("No qualities - skip", flush=True)
-            return
+    # Snapshot all the data we need right now so the queue item is self-contained
+    await _channel_post_queue.put((
+        channel_post.message_id,
+        channel_post.video.file_id,
+        channel_post.caption or "",   # original caption / filename from leech bot
+        chat_id,
+        context,
+    ))
+    qsize = _channel_post_queue.qsize()
+    print(f"Queued msg={channel_post.message_id}  queue_depth={qsize}", flush=True)
 
-        quality     = current_quality()
-        caption     = build_caption(quality)
-        msg_id      = channel_post.message_id
+
+# ══════════════════════════════════════════════════════════════
+#  ACTUAL PROCESSING  (called by the worker, never concurrently)
+# ══════════════════════════════════════════════════════════════
+async def _process_channel_post(
+    msg_id: int,
+    video_file_id: str,
+    original_caption: str,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    # Always reload from DB so we have the very latest counters
+    await load_progress()
+
+    if not progress["selected_qualities"]:
+        print("No qualities - skip", flush=True)
+        return
+
+    # ── Episode recognition ─────────────────────────────────────
+    # Try to parse S__E__ and quality from the caption the leech bot set.
+    # Example: "[@Beat_Hindi_Dubbed] Spy x Family S01E25 720p x264 BDRip Multi Audio ESub.mkv"
+    parsed_season, parsed_ep, parsed_quality = parse_episode_info(original_caption)
+
+    if parsed_season is not None and parsed_ep is not None:
+        # ── AUTO-RECOGNISED mode ────────────────────────────────
+        # Use the values straight from the filename; do NOT advance counters.
+        quality = current_quality()
+        caption = build_caption(quality, season=parsed_season, episode=parsed_ep)
+        print(
+            f"Recognised S{parsed_season:02}E{parsed_ep:02} Q={quality} "
+            f"from caption — counters unchanged",
+            flush=True,
+        )
         cover_input = await get_cover_input(context)
-
-        print(f"Auto-post msg={msg_id} Q={quality} cover={'Y' if cover_input else 'N'}", flush=True)
-
         try:
             if cover_input:
                 try:
@@ -865,23 +973,57 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     print(f"Delete failed: {del_err}", flush=True)
                 await context.bot.send_video(
                     chat_id=chat_id,
-                    video=channel_post.video.file_id,
+                    video=video_file_id,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
                     thumbnail=cover_input,
                     api_kwargs={"cover": cover_input},
                 )
-                print("Re-posted with cover + caption", flush=True)
+                print(f"Re-posted with cover + caption (recognised)", flush=True)
             else:
                 await context.bot.edit_message_caption(
                     chat_id=chat_id, message_id=msg_id,
                     caption=caption, parse_mode=ParseMode.HTML,
                 )
-                print("Caption edited (no cover)", flush=True)
-            await advance_counters()
+                print("Caption edited (no cover, recognised)", flush=True)
         except Exception as e:
             print(f"Channel post error msg={msg_id}: {e}", flush=True)
             import traceback; traceback.print_exc()
+        # Do NOT call advance_counters() — episode came from filename, not our counter.
+        return
+
+    # ── COUNTER mode (no S__E__ found in caption) ───────────────
+    quality     = current_quality()
+    caption     = build_caption(quality)
+    cover_input = await get_cover_input(context)
+    print(f"Counter mode msg={msg_id} Q={quality} cover={'Y' if cover_input else 'N'}", flush=True)
+
+    try:
+        if cover_input:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                print(f"Deleted original {msg_id}", flush=True)
+            except Exception as del_err:
+                print(f"Delete failed: {del_err}", flush=True)
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=video_file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                thumbnail=cover_input,
+                api_kwargs={"cover": cover_input},
+            )
+            print("Re-posted with cover + caption", flush=True)
+        else:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id, message_id=msg_id,
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
+            print("Caption edited (no cover)", flush=True)
+        await advance_counters()
+    except Exception as e:
+        print(f"Channel post error msg={msg_id}: {e}", flush=True)
+        import traceback; traceback.print_exc()
 
 # ══════════════════════════════════════════════════════════════
 #  WEB SERVER & SELF-PING
@@ -912,12 +1054,22 @@ async def start_web_server():
     asyncio.create_task(self_ping())
 
 async def post_init(application: Application):
+    global _queue_worker_task
     await init_db()
     await start_web_server()
+    # Start the single serial worker for channel posts
+    _queue_worker_task = asyncio.create_task(_channel_post_worker())
+    print("Channel-post queue worker started", flush=True)
 
 async def post_shutdown(application: Application):
-    global db_pool
+    global db_pool, _queue_worker_task
     print("Shutting down", flush=True)
+    if _queue_worker_task:
+        _queue_worker_task.cancel()
+        try:
+            await _queue_worker_task
+        except asyncio.CancelledError:
+            pass
     if db_pool:
         try:
             await db_pool.close()
